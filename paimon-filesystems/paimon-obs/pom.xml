@@ -23,7 +23,7 @@
     <parent>
         <groupId>org.apache.paimon</groupId>
         <artifactId>paimon-filesystems</artifactId>
-        <version>1.2.0</version>
+        <version>1.2.0-msxf-1.0.1</version>
     </parent>
 
     <artifactId>paimon-obs</artifactId>

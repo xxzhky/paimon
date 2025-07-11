@@ -24,7 +24,7 @@
     <parent>
         <artifactId>paimon-filesystems</artifactId>
         <groupId>org.apache.paimon</groupId>
-        <version>1.2.0</version>
+        <version>1.2.0-msxf-1.0.1</version>
     </parent>
 
 
