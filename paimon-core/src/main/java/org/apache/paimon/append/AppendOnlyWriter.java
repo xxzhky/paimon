@@ -21,6 +21,7 @@ package org.apache.paimon.append;
 import org.apache.paimon.annotation.VisibleForTesting;
 import org.apache.paimon.compact.CompactDeletionFile;
 import org.apache.paimon.compact.CompactManager;
+import org.apache.paimon.compact.CompactResult;
 import org.apache.paimon.compression.CompressOptions;
 import org.apache.paimon.data.InternalRow;
 import org.apache.paimon.disk.IOManager;
@@ -28,6 +29,7 @@ import org.apache.paimon.disk.RowBuffer;
 import org.apache.paimon.fileindex.FileIndexOptions;
 import org.apache.paimon.format.FileFormat;
 import org.apache.paimon.fs.FileIO;
+import org.apache.paimon.fs.Path;
 import org.apache.paimon.io.BundleRecords;
 import org.apache.paimon.io.CompactIncrement;
 import org.apache.paimon.io.DataFileMeta;
@@ -51,13 +53,19 @@ import org.apache.paimon.utils.SinkWriter;
 import org.apache.paimon.utils.SinkWriter.BufferedSinkWriter;
 import org.apache.paimon.utils.SinkWriter.DirectSinkWriter;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import javax.annotation.Nullable;
 
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
+import java.util.Optional;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.locks.ReentrantLock;
 
 /**
  * A {@link RecordWriter} implementation that only accepts records which are always insert
@@ -65,6 +73,7 @@ import java.util.concurrent.ExecutionException;
  */
 public class AppendOnlyWriter implements BatchRecordWriter, MemoryOwner {
 
+    private static final Logger LOG = LoggerFactory.getLogger(AppendOnlyWriter.class);
     private final FileIO fileIO;
     private final long schemaId;
     private final FileFormat fileFormat;
@@ -303,16 +312,109 @@ public class AppendOnlyWriter implements BatchRecordWriter, MemoryOwner {
                 statsDenseStore);
     }
 
-    private void trySyncLatestCompaction(boolean blocking)
-            throws ExecutionException, InterruptedException {
-        compactManager
-                .getCompactionResult(blocking)
-                .ifPresent(
-                        result -> {
-                            compactBefore.addAll(result.before());
-                            compactAfter.addAll(result.after());
-                            updateCompactDeletionFile(result.deletionFile());
-                        });
+    // Members assumed to exist:
+    // final Set<DataFileMeta> compactBefore = new LinkedHashSet<>();
+    // final Set<DataFileMeta> compactAfter  = new LinkedHashSet<>();
+    // final FileIO fileIO;
+    // final PathFactory pathFactory;
+    // final CompactManager compactManager;
+    // (Optional) basic metrics:
+    final AtomicLong filesDeleted = new AtomicLong();
+    final AtomicLong filesMarkedBefore = new AtomicLong();
+    final ReentrantLock compactLock = new ReentrantLock();
+
+    /**
+     * Try to sync the latest compaction result from the manager and apply it locally. This method
+     * is exception-safe and will not throw; failures are logged and skipped.
+     *
+     * @param blocking whether to wait until a result is available
+     */
+    private void trySyncLatestCompaction(boolean blocking) {
+        try {
+            Optional<CompactResult> result = compactManager.getCompactionResult(blocking);
+            result.ifPresent(this::updateCompactResult);
+        } catch (ExecutionException | InterruptedException e) {
+            // Preserve interrupt status if interrupted.
+            if (e instanceof InterruptedException) {
+                Thread.currentThread().interrupt();
+            }
+            // Best-effort: log and continue.
+            LOG.warn("Failed to retrieve compaction result (blocking={}).", blocking, e);
+        }
+    }
+
+    /**
+     * Apply a compaction result to local state: - Files in 'before' that are also in current
+     * compactAfter are intermediate files from previous rounds and can be deleted. - Remaining
+     * 'before' files are tracked in compactBefore for correctness. - All 'after' files are added to
+     * compactAfter. - Deletion file (if any) is updated afterwards.
+     *
+     * <p>This method minimizes time spent under lock and performs IO outside the lock.
+     */
+    private void updateCompactResult(CompactResult result) {
+        // Defensive copies without relying on ternary generic inference
+        final List<DataFileMeta> before =
+                (result.before() != null) ? new ArrayList<>(result.before()) : new ArrayList<>();
+        final List<DataFileMeta> after =
+                (result.after() != null) ? new ArrayList<>(result.after()) : new ArrayList<>();
+
+        // Will be deleted AFTER we release the lock to avoid blocking writers/readers.
+        final List<Path> toDelete = new ArrayList<>();
+
+        // ---- Critical section: mutate in-memory sets only
+        compactLock.lock();
+        try {
+            if (!before.isEmpty()) {
+                // Identify "intermediate" files: those that currently exist in compactAfter.
+                // Remove them from compactAfter in bulk, and schedule physical deletion.
+                for (DataFileMeta f : before) {
+                    if (compactAfter.remove(f)) {
+                        // This is an intermediate file (not a new data file), safe to delete.
+                        toDelete.add(pathFactory.toPath(f));
+                    } else {
+                        // True 'before' file that was visible to readers; keep track.
+                        compactBefore.add(f);
+                    }
+                }
+                if (!toDelete.isEmpty()) {
+                    filesDeleted.addAndGet(toDelete.size());
+                }
+                filesMarkedBefore.addAndGet(before.size() - toDelete.size());
+            }
+
+            if (!after.isEmpty()) {
+                // Adding 'after' files; Set semantics guarantee de-duplication.
+                compactAfter.addAll(after);
+            }
+        } finally {
+            compactLock.unlock();
+        }
+        // ---- End critical section
+
+        // Perform IO deletions outside the lock to keep contention low.
+        // Use quiet delete per file; failures are logged but do not abort the flow.
+        for (Path p : toDelete) {
+            try {
+                fileIO.deleteQuietly(p);
+            } catch (Throwable t) {
+                // deleteQuietly should already suppress most issues, but we double-guard here.
+                LOG.warn("Failed to delete intermediate file: {}", p, t);
+            }
+        }
+
+        // Update deletion file if present.
+        // This is typically metadata update; keep it out of the lock unless it requires shared
+        // structures.
+        if (result.deletionFile() != null) {
+            try {
+                updateCompactDeletionFile(result.deletionFile());
+            } catch (Throwable t) {
+                LOG.warn(
+                        "Failed to update deletion file for compaction result: {}",
+                        result.deletionFile(),
+                        t);
+            }
+        }
     }
 
     private void updateCompactDeletionFile(@Nullable CompactDeletionFile newDeletionFile) {
