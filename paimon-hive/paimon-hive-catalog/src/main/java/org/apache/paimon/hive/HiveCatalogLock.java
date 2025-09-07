@@ -88,6 +88,7 @@ public class HiveCatalogLock implements CatalogLock {
         long startRetry = System.currentTimeMillis();
         while (lockResponse.getState() == LockState.WAITING) {
             nextSleep *= 2;
+            // 100 200 400 800 1600 3200 6400
             if (nextSleep > checkMaxSleep) {
                 nextSleep = checkMaxSleep;
             }
