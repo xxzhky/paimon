@@ -40,13 +40,13 @@ public class HiveAlterTableUtils {
 
     private static void alterTableWithEnv(
             IMetaStoreClient client, Identifier identifier, Table table) throws TException {
-        boolean skipHiveUpdateStats =
-                Boolean.parseBoolean(
-                        table.getParameters().get(StatsSetupConst.DO_NOT_UPDATE_STATS));
         EnvironmentContext environmentContext = new EnvironmentContext();
-        environmentContext.putToProperties(StatsSetupConst.CASCADE, "true");
+        environmentContext.putToProperties(StatsSetupConst.CASCADE, StatsSetupConst.TRUE);
+        // Prevent Hive from updating table statistics, which may cause concurrent modification
+        // issues for PB tables or a large number of table partitions.
+        // Refer to Iceberg's implementation: MetastoreUtil#alterTable for more details.
         environmentContext.putToProperties(
-                StatsSetupConst.DO_NOT_UPDATE_STATS, Boolean.toString(skipHiveUpdateStats));
+                StatsSetupConst.DO_NOT_UPDATE_STATS, StatsSetupConst.TRUE);
         client.alter_table_with_environmentContext(
                 identifier.getDatabaseName(), identifier.getTableName(), table, environmentContext);
     }
